@@ -2,6 +2,7 @@
 module.exports = Service;
 
 var util = require("../util/minimal");
+var EventEmitter = require("../../lib/eventemitter");
 
 // Extends EventEmitter
 (Service.prototype = Object.create(util.EventEmitter.prototype)).constructor = Service;
@@ -81,8 +82,9 @@ Service.prototype.rpcCall = function rpcCall(method, requestCtor, responseCtor, 
     if (!request)
         throw TypeError("request must be specified");
 
+    var streaming = method.responseStream || method.requestStream;
     var self = this;
-    if (!callback)
+    if (!callback && !streaming)
         return util.asPromise(rpcCall, self, method, requestCtor, responseCtor, request);
 
     if (!self.rpcImpl) {
@@ -90,19 +92,23 @@ Service.prototype.rpcCall = function rpcCall(method, requestCtor, responseCtor, 
         return undefined;
     }
 
+    var emitter = self;
+
     try {
-        return self.rpcImpl(
-            method,
-            requestCtor[self.requestDelimited ? "encodeDelimited" : "encode"](request).finish(),
-            function rpcCallback(err, response) {
 
-                if (err) {
-                    self.emit("error", err, method);
-                    return callback(err);
-                }
+        if(streaming) {
+            var req = new EventEmitter();
+            var res = new EventEmitter();
+            
+            self.rpcImpl(
+                method,
+                requestCtor[self.requestDelimited ? "encodeDelimited" : "encode"](request).finish(),
+                req
+            );
 
+            req.write = function rpcCallback(response) {
                 if (response === null) {
-                    self.end(/* endedByRPC */ true);
+                    res.end(/* endedByRPC */ true);
                     return undefined;
                 }
 
@@ -110,15 +116,72 @@ Service.prototype.rpcCall = function rpcCall(method, requestCtor, responseCtor, 
                     try {
                         response = responseCtor[self.responseDelimited ? "decodeDelimited" : "decode"](response);
                     } catch (err) {
-                        self.emit("error", err, method);
-                        return callback(err);
+                        res.emit("error", err, method);
+                        return;
                     }
                 }
 
-                self.emit("data", response, method);
-                return callback(null, response);
-            }
-        );
+                res.emit("data", response, method);
+                return;
+            };
+
+            req.end = function() {
+                res.emit("end");
+            };
+
+            res.write = function(data) {
+                req.emit('data', data);
+            };
+
+            res.end = function() {
+                req.emit('end');
+            };
+
+            res.on("end", () => {
+                res.write = function() {
+                    throw new Error("Cannot write to ended stream");
+                };
+            });
+            
+            req.on("end", () => {
+                req.write = function() {
+                    throw new Error("Cannot write to ended stream");
+                };
+            });
+            return res;
+        } else {
+            var res = self.rpcImpl(
+                method,
+                requestCtor[self.requestDelimited ? "encodeDelimited" : "encode"](request).finish(),
+                function rpcCallback(err, response) {
+
+                    if (err) {
+                        self.emit("error", err, method);
+                        return callback(err);
+                    }
+
+                    if (response === null) {
+                        self.end(/* endedByRPC */ true);
+                        return undefined;
+                    }
+
+                    if (!(response instanceof responseCtor)) {
+                        try {
+                            response = responseCtor[self.responseDelimited ? "decodeDelimited" : "decode"](response);
+                        } catch (err) {
+                            self.emit("error", err, method);
+                            return callback(err);
+                        }
+                    }
+
+                    self.emit("data", response, method);
+                    return callback(null, response);
+                }
+            );
+        }
+
+        return res;
+
     } catch (err) {
         self.emit("error", err, method);
         setTimeout(function() { callback(err); }, 0);
