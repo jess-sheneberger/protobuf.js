@@ -125,6 +125,10 @@ Service.prototype.rpcCall = function rpcCall(method, requestCtor, responseCtor, 
                 return;
             };
 
+            res.closeAndRecv = function() {
+                req.emit("closeAndRecv");
+            }
+
             req.end = function() {
                 res.emit("end");
             };
